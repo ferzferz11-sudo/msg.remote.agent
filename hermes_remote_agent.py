@@ -264,7 +264,11 @@ class RemoteAgent:
             await asyncio.sleep(CONNECT_RETRY_DELAY)
 
     async def _handle_task(self, task):
-        print(f"[Agent] Task {task.task_id}: type={pb.TaskType.Name(task.task_type)}, params={dict(task.params)}")
+        try:
+            type_name = pb.TaskType.Name(task.task_type)
+        except ValueError:
+            type_name = f"UNKNOWN({task.task_type})"
+        print(f"[Agent] Task {task.task_id}: type={type_name}, params={dict(task.params)}")
         start = time.time()
 
         stdout, stderr, exit_code = "", "", 0
@@ -286,7 +290,7 @@ class RemoteAgent:
             elif task.task_type == pb.TASK_CUSTOM:
                 stdout, stderr, exit_code = await self._exec_shell(task.params)
             else:
-                stderr = f"Unsupported: {pb.TaskType.Name(task.task_type)}"
+                stderr = f"Unsupported: {type_name}"
                 exit_code = 1
         except Exception as e:
             stderr = str(e)
