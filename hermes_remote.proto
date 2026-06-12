@@ -1,0 +1,246 @@
+syntax = "proto3";
+package hermes_agent;
+option go_package = "LavenderMessenger/gen/hermes_agent";
+
+// HermesAgentService — протокол связи между Remote Agent и Orchestrator
+// Агент подключается к Orchestrator и держит bidirectional stream
+service HermesAgentService {
+  // Connect — основной метод: агент подключается и обменивается сообщениями
+  rpc Connect(stream AgentMessage) returns (stream OrchestratorMessage);
+  // HealthCheck — проверка связи (одноразовый вызов)
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  // GenerateAgentToken — генерация JWT токена для нового агента (admin only)
+  rpc GenerateAgentToken(GenerateAgentTokenRequest) returns (GenerateAgentTokenResponse);
+  // RevokeAgentToken — отзыв токена агента (admin only)
+  rpc RevokeAgentToken(RevokeAgentTokenRequest) returns (RevokeAgentTokenResponse);
+  // ListAgentTokens — список всех токенов агентов (admin only)
+  rpc ListAgentTokens(ListAgentTokensRequest) returns (ListAgentTokensResponse);
+  // StartAgent — запуск удалённого агента на сервере (admin only)
+  rpc StartAgent(StartAgentRequest) returns (StartAgentResponse);
+  // StopAgent — остановка удалённого агента на сервере (admin only)
+  rpc StopAgent(StopAgentRequest) returns (StopAgentResponse);
+  // GetAgentProcessStatus — статус процесса агента на сервере (admin only)
+  rpc GetAgentProcessStatus(GetAgentProcessStatusRequest) returns (GetAgentProcessStatusResponse);
+}
+
+// AgentMessage → от агента к оркестратору
+message AgentMessage {
+  string agent_id = 1;
+  AgentMessageType type = 2;
+  bytes payload = 3; // сериализованный TaskResult / RegistrationInfo / LogEntry
+  int64 timestamp_ms = 4;
+}
+
+// OrchestratorMessage → от оркестратору к агенту
+message OrchestratorMessage {
+  string target_agent_id = 1;
+  OrchestratorMessageType type = 2;
+  bytes payload = 3; // сериализованный Task / AgentConfig / Ping
+  int64 timestamp_ms = 4;
+}
+
+enum AgentMessageType {
+  AGENT_MESSAGE_UNKNOWN = 0;
+  AGENT_REGISTER = 1;      // Регистрация агента (при подключении)
+  AGENT_HEARTBEAT = 2;     // Пинг-понг (каждые 30с)
+  AGENT_TASK_RESULT = 3;   // Результат выполнения задачи
+  AGENT_LOG = 4;           // Лог от агента
+  AGENT_DISCONNECT = 5;    // Корректное отключение
+  AGENT_ERROR = 6;         // Ошибка на стороне агента
+}
+
+enum OrchestratorMessageType {
+  ORCHESTRATOR_MESSAGE_UNKNOWN = 0;
+  ORCHESTRATOR_TASK = 1;        // Задача для выполнения
+  ORCHESTRATOR_CONFIG_UPDATE = 2; // Обновление конфигурации агента
+  ORCHESTRATOR_PING = 3;        // Пинг (ожидается HEARTBEAT в ответ)
+  ORCHESTRATOR_DISCONNECT = 4;  // Оркестратор инициирует отключение
+  ORCHESTRATOR_BROADCAST = 5;   // Широковещательное сообщение всем агентам
+}
+
+// RegistrationInfo — данные при регистрации агента (payload для AGENT_REGISTER)
+message RegistrationInfo {
+  string agent_id = 1;
+  string agent_name = 2;
+  string version = 3;
+  string host = 4;           // hostname сервера
+  string ip_address = 5;
+  string os = 6;             // linux, darwin, etc.
+  repeated string capabilities = 7; // shell, git, build, deploy, file, docker, ai
+  string auth_token = 8;     // токен аутентификации
+}
+
+// Task — задача для удалённого агента (payload для ORCHESTRATOR_TASK)
+message Task {
+  string task_id = 1;
+  TaskType task_type = 2;
+  map<string, string> params = 3;   // параметры задачи
+  string working_dir = 4;           // рабочая директория
+  int32 timeout_sec = 5;            // таймаут (0 = без ограничений)
+  bool stream_output = 6;           // стримить вывод в реальном времени
+}
+
+enum TaskType {
+  TASK_UNKNOWN = 0;
+  TASK_SHELL = 1;       // shell команда
+  TASK_FILE_READ = 2;   // чтение файла
+  TASK_FILE_WRITE = 3;  // запись файла
+  TASK_GIT = 4;         // git операции (clone, pull, commit, push)
+  TASK_BUILD = 5;       // сборка проекта
+  TASK_DEPLOY = 6;      // деплой
+  TASK_DOCKER = 7;      // docker операции
+  TASK_CUSTOM = 8;      // пользовательский скрипт
+  TASK_AI = 9;          // AI-ответ (агент сам решает как ответить)
+}
+
+// TaskResult — результат выполнения (payload для AGENT_TASK_RESULT)
+message TaskResult {
+  string task_id = 1;
+  TaskStatus status = 2;
+  string stdout = 3;        // stdout выполнения
+  string stderr = 4;        // stderr выполнения
+  int32 exit_code = 5;      // exit code (для shell команд)
+  int64 duration_ms = 6;    // время выполнения
+  string error = 7;         // описание ошибки
+  repeated FileEntry files = 8; // изменённые/созданные файлы
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNKNOWN = 0;
+  TASK_SUCCESS = 1;
+  TASK_ERROR = 2;
+  TASK_TIMEOUT = 3;
+  TASK_CANCELLED = 4;
+}
+
+// FileEntry — информация о файле
+message FileEntry {
+  string path = 1;
+  int64 size = 2;
+  string checksum = 3;      // sha256
+}
+
+// AgentConfig — конфигурация агента (payload для ORCHESTRATOR_CONFIG_UPDATE)
+message AgentConfig {
+  int32 heartbeat_interval_sec = 1;
+  int32 max_concurrent_tasks = 2;
+  map<string, string> env_vars = 3;
+  repeated string allowed_commands = 4; // whitelist shell команд
+  repeated string blocked_commands = 5; // blacklist shell команд
+}
+
+// LogEntry — лог-запись (payload для AGENT_LOG)
+message LogEntry {
+  LogLevel level = 1;
+  string message = 2;
+  map<string, string> fields = 3;
+}
+
+enum LogLevel {
+  LOG_DEBUG = 0;
+  LOG_INFO = 1;
+  LOG_WARN = 2;
+  LOG_ERROR = 3;
+}
+
+// HealthCheck
+message HealthCheckRequest {
+  string agent_id = 1;
+}
+message HealthCheckResponse {
+  string status = 1;  // "ok", "degraded", "error"
+  string version = 2;
+  int64 uptime_sec = 3;
+  int32 active_tasks = 4;
+  float cpu_percent = 5;
+  float memory_percent = 6;
+}
+
+// === Agent Token Management (admin RPCs) ===
+
+message GenerateAgentTokenRequest {
+  string agent_id = 1;
+  string agent_name = 2;
+  repeated string capabilities = 3; // shell, git, build, deploy, file, docker
+  int32 ttl_hours = 4;             // время жизни токена в часах (0 = 24ч по умолчанию)
+  string admin_user_id = 5;        // ID админа для проверки прав
+}
+
+message GenerateAgentTokenResponse {
+  bool success = 1;
+  string token = 2;       // JWT токен (показывается только один раз!)
+  string error = 3;
+  int64 expires_at = 4;   // unix timestamp
+}
+
+message RevokeAgentTokenRequest {
+  string agent_id = 1;
+  string admin_user_id = 2;
+}
+
+message RevokeAgentTokenResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ListAgentTokensRequest {
+  string admin_user_id = 1;
+}
+
+message AgentTokenInfo {
+  int64 id = 1;
+  string agent_id = 2;
+  string agent_name = 3;
+  string token_hash = 4; // только хеш, не сам токен
+  repeated string capabilities = 5;
+  string created_at = 6;
+  string expires_at = 7;
+  bool revoked = 8;
+  string created_by = 9;
+}
+
+message ListAgentTokensResponse {
+  bool success = 1;
+  repeated AgentTokenInfo tokens = 2;
+  string error = 3;
+}
+
+// === Agent Process Management (server-side) ===
+
+message StartAgentRequest {
+  string agent_id = 1;
+  string agent_name = 2;
+  string token = 3;           // JWT токен агента
+  string server_address = 4;  // адрес gRPC сервера (host:port)
+  repeated string capabilities = 5;
+  string admin_user_id = 6;
+}
+
+message StartAgentResponse {
+  bool success = 1;
+  string error = 2;
+  int32 pid = 3;              // PID запущенного процесса
+}
+
+message StopAgentRequest {
+  string agent_id = 1;
+  string admin_user_id = 2;
+}
+
+message StopAgentResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message GetAgentProcessStatusRequest {
+  string agent_id = 1;
+  string admin_user_id = 2;
+}
+
+message GetAgentProcessStatusResponse {
+  bool running = 1;
+  int32 pid = 2;
+  string agent_id = 3;
+  string started_at = 4;
+  string error = 5;
+}
