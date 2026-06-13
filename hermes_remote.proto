@@ -41,12 +41,13 @@ message OrchestratorMessage {
 
 enum AgentMessageType {
   AGENT_MESSAGE_UNKNOWN = 0;
-  AGENT_REGISTER = 1;      // Регистрация агента (при подключении)
-  AGENT_HEARTBEAT = 2;     // Пинг-понг (каждые 30с)
-  AGENT_TASK_RESULT = 3;   // Результат выполнения задачи
-  AGENT_LOG = 4;           // Лог от агента
-  AGENT_DISCONNECT = 5;    // Корректное отключение
-  AGENT_ERROR = 6;         // Ошибка на стороне агента
+  AGENT_REGISTER = 1;              // Регистрация агента (при подключении)
+  AGENT_HEARTBEAT = 2;             // Пинг-понг (каждые 30с)
+  AGENT_TASK_RESULT = 3;           // Результат выполнения задачи (финальный)
+  AGENT_LOG = 4;                   // Лог от агента
+  AGENT_DISCONNECT = 5;            // Корректное отключение
+  AGENT_ERROR = 6;                 // Ошибка на стороне агента
+  AGENT_TASK_STREAM_UPDATE = 7;    // Промежуточное обновление задачи (streaming)
 }
 
 enum OrchestratorMessageType {
@@ -103,6 +104,17 @@ message TaskResult {
   int64 duration_ms = 6;    // время выполнения
   string error = 7;         // описание ошибки
   repeated FileEntry files = 8; // изменённые/созданные файлы
+}
+
+// TaskStreamUpdate — промежуточное обновление (payload для AGENT_TASK_STREAM_UPDATE)
+// Отправляется агентом во время выполнения задачи для real-time вывода
+message TaskStreamUpdate {
+  string task_id = 1;
+  string stdout_chunk = 2;  // промежуточный stdout (построчно)
+  string stderr_chunk = 3;  // промежуточный stderr (построчно)
+  string progress = 4;      // текстовый прогресс ("Компиляция...", "Тест 3/10...")
+  string status = 5;        // "running", "completed", "failed", "timeout", "cancelled"
+  bool done = 6;            // true = последнее сообщение, далее ожидается TaskResult
 }
 
 enum TaskStatus {

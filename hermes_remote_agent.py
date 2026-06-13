@@ -263,6 +263,27 @@ class RemoteAgent:
             self.stream = None
             await asyncio.sleep(CONNECT_RETRY_DELAY)
 
+    async def _send_stream_update(self, task_id, stdout_chunk="", stderr_chunk="",
+                                   progress="", status="running", done=False):
+        """Send TaskStreamUpdate to the server via the bidirectional stream."""
+        try:
+            update = pb.TaskStreamUpdate(
+                task_id=task_id,
+                stdout_chunk=stdout_chunk[:2000],
+                stderr_chunk=stderr_chunk[:2000],
+                progress=progress,
+                status=status,
+                done=done,
+            )
+            await self.stream.write(pb.AgentMessage(
+                agent_id=self.agent_id,
+                type=pb.AGENT_TASK_STREAM_UPDATE,
+                payload=update.SerializeToString(),
+                timestamp_ms=int(time.time() * 1000),
+            ))
+        except Exception as e:
+            print(f"[Agent] Failed to send stream update: {e}")
+
     async def _handle_task(self, task):
         try:
             type_name = pb.TaskType.Name(task.task_type)
@@ -271,41 +292,68 @@ class RemoteAgent:
         print(f"[Agent] Task {task.task_id}: type={type_name}, params={dict(task.params)}")
         start = time.time()
 
-        stdout, stderr, exit_code = "", "", 0
+        stdout_buf, stderr_buf = [], []
+        exit_code = 0
         status = "success"
+
+        # Notify server that task is accepted
+        await self._send_stream_update(task.task_id, progress="Задача принята", status="running")
 
         try:
             if task.task_type in (pb.TASK_SHELL, pb.TASK_AI):
-                stdout, stderr, exit_code = await self._exec_shell(task.params)
+                exit_code = await self._exec_shell_streaming(task, stdout_buf, stderr_buf)
             elif task.task_type == pb.TASK_GIT:
-                stdout, stderr, exit_code = await self._exec_git(task.params)
+                exit_code = await self._exec_git_streaming(task, stdout_buf, stderr_buf)
             elif task.task_type == pb.TASK_BUILD:
-                stdout, stderr, exit_code = await self._exec_build(task.params, task.working_dir)
+                exit_code = await self._exec_build_streaming(task, stdout_buf, stderr_buf)
             elif task.task_type == pb.TASK_FILE_READ:
-                stdout, stderr, exit_code = await self._read_file(task.params)
+                out, err, code = await self._read_file(task.params)
+                stdout_buf.append(out)
+                stderr_buf.append(err)
+                exit_code = code
             elif task.task_type == pb.TASK_FILE_WRITE:
-                stdout, stderr, exit_code = await self._write_file(task.params)
+                out, err, code = await self._write_file(task.params)
+                stdout_buf.append(out)
+                stderr_buf.append(err)
+                exit_code = code
             elif task.task_type == pb.TASK_DOCKER:
-                stdout, stderr, exit_code = await self._exec_docker(task.params)
+                exit_code = await self._exec_docker_streaming(task, stdout_buf, stderr_buf)
             elif task.task_type == pb.TASK_CUSTOM:
-                stdout, stderr, exit_code = await self._exec_shell(task.params)
+                exit_code = await self._exec_shell_streaming(task, stdout_buf, stderr_buf)
             else:
-                stderr = f"Unsupported: {type_name}"
+                stderr_buf.append(f"Unsupported: {type_name}")
                 exit_code = 1
+        except asyncio.TimeoutError:
+            stderr_buf.append("timeout")
+            exit_code = 124
+            status = "timeout"
         except Exception as e:
-            stderr = str(e)
+            stderr_buf.append(str(e))
             exit_code = 1
 
-        if exit_code != 0:
+        if exit_code != 0 and status == "success":
             status = "error"
 
         duration_ms = int((time.time() - start) * 1000)
+        full_stdout = "".join(stdout_buf)
+        full_stderr = "".join(stderr_buf)
 
+        # Send final stream update with done=True
+        await self._send_stream_update(
+            task.task_id,
+            stdout_chunk=full_stdout[:5000],
+            stderr_chunk=full_stderr[:5000],
+            progress=f"Завершено ({status})",
+            status=status,
+            done=True,
+        )
+
+        # Send final TaskResult (for backward compatibility)
         result = pb.TaskResult(
             task_id=task.task_id,
             status=task_status_to_proto(status),
-            stdout=stdout[:10000],
-            stderr=stderr[:5000],
+            stdout=full_stdout[:10000],
+            stderr=full_stderr[:5000],
             exit_code=exit_code,
             duration_ms=duration_ms,
         )
@@ -318,12 +366,253 @@ class RemoteAgent:
                 timestamp_ms=int(time.time() * 1000),
             ))
             print(f"[Agent] Task {task.task_id} done: {status} (exit={exit_code}, {duration_ms}ms)")
-            if stdout:
-                print(f"[Agent] stdout: {stdout[:200]}")
+            if full_stdout:
+                print(f"[Agent] stdout: {full_stdout[:200]}")
         except Exception as e:
             print(f"[Agent] Failed to send result: {e}")
 
+    async def _exec_shell_streaming(self, task, stdout_buf, stderr_buf):
+        """Execute shell command with streaming stdout/stderr."""
+        cmd = task.params.get("command", "")
+        if not cmd:
+            stderr_buf.append("no command specified")
+            return 1
+        print(f"[Agent] Shell: {cmd}")
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            # Read stdout/stderr line by line with timeout
+            timeout = task.timeout_sec if task.timeout_sec > 0 else 120
+            deadline = time.time() + timeout
+
+            async def read_stream(stream, buf, label):
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        line = await asyncio.wait_for(stream.readline(), timeout=min(remaining, 1.0))
+                        if not line:
+                            break
+                        decoded = line.decode(errors="replace")
+                        buf.append(decoded)
+                        # Send chunk to server (without done flag — just streaming)
+                        await self._send_stream_update(
+                            task.task_id,
+                            **{f"{label}_chunk": decoded},
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception:
+                        break
+
+            await asyncio.gather(
+                read_stream(proc.stdout, stdout_buf, "stdout"),
+                read_stream(proc.stderr, stderr_buf, "stderr"),
+            )
+
+            remaining = deadline - time.time()
+            if remaining > 0:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    return 124
+            else:
+                proc.kill()
+                await proc.wait()
+                return 124
+
+            return proc.returncode or 0
+        except asyncio.TimeoutError:
+            proc.kill()
+            return 124
+
+    async def _exec_git_streaming(self, task, stdout_buf, stderr_buf):
+        """Execute git command with streaming output."""
+        args = []
+        for key in ["subcommand", "args", "message", "branch", "remote", "path"]:
+            if key in task.params:
+                args.append(task.params[key])
+        if not args:
+            stderr_buf.append("no git subcommand")
+            return 1
+        print(f"[Agent] git {' '.join(args)}")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            timeout = task.timeout_sec if task.timeout_sec > 0 else 60
+            deadline = time.time() + timeout
+
+            async def read_stream(stream, buf, label):
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        line = await asyncio.wait_for(stream.readline(), timeout=min(remaining, 1.0))
+                        if not line:
+                            break
+                        decoded = line.decode(errors="replace")
+                        buf.append(decoded)
+                        await self._send_stream_update(
+                            task.task_id,
+                            **{f"{label}_chunk": decoded},
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception:
+                        break
+
+            await asyncio.gather(
+                read_stream(proc.stdout, stdout_buf, "stdout"),
+                read_stream(proc.stderr, stderr_buf, "stderr"),
+            )
+
+            remaining = deadline - time.time()
+            if remaining > 0:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    return 124
+            else:
+                proc.kill()
+                await proc.wait()
+                return 124
+
+            return proc.returncode or 0
+        except asyncio.TimeoutError:
+            proc.kill()
+            return 124
+
+    async def _exec_build_streaming(self, task, stdout_buf, stderr_buf):
+        """Execute build command with streaming output."""
+        cmd = task.params.get("command", "go build ./...")
+        print(f"[Agent] Build: {cmd} (dir={task.working_dir})")
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=task.working_dir or None,
+            )
+            timeout = task.timeout_sec if task.timeout_sec > 0 else 300
+            deadline = time.time() + timeout
+
+            async def read_stream(stream, buf, label):
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        line = await asyncio.wait_for(stream.readline(), timeout=min(remaining, 1.0))
+                        if not line:
+                            break
+                        decoded = line.decode(errors="replace")
+                        buf.append(decoded)
+                        await self._send_stream_update(
+                            task.task_id,
+                            **{f"{label}_chunk": decoded},
+                            progress=f"Сборка... ({len(buf)} строк)" if label == "stdout" else "",
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception:
+                        break
+
+            await asyncio.gather(
+                read_stream(proc.stdout, stdout_buf, "stdout"),
+                read_stream(proc.stderr, stderr_buf, "stderr"),
+            )
+
+            remaining = deadline - time.time()
+            if remaining > 0:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    return 124
+            else:
+                proc.kill()
+                await proc.wait()
+                return 124
+
+            return proc.returncode or 0
+        except asyncio.TimeoutError:
+            proc.kill()
+            return 124
+
+    async def _exec_docker_streaming(self, task, stdout_buf, stderr_buf):
+        """Execute docker command with streaming output."""
+        cmd = task.params.get("command", "")
+        if not cmd:
+            stderr_buf.append("no docker command")
+            return 1
+        print(f"[Agent] Docker: {cmd}")
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f"docker {cmd}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            timeout = task.timeout_sec if task.timeout_sec > 0 else 120
+            deadline = time.time() + timeout
+
+            async def read_stream(stream, buf, label):
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        line = await asyncio.wait_for(stream.readline(), timeout=min(remaining, 1.0))
+                        if not line:
+                            break
+                        decoded = line.decode(errors="replace")
+                        buf.append(decoded)
+                        await self._send_stream_update(
+                            task.task_id,
+                            **{f"{label}_chunk": decoded},
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception:
+                        break
+
+            await asyncio.gather(
+                read_stream(proc.stdout, stdout_buf, "stdout"),
+                read_stream(proc.stderr, stderr_buf, "stderr"),
+            )
+
+            remaining = deadline - time.time()
+            if remaining > 0:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    return 124
+            else:
+                proc.kill()
+                await proc.wait()
+                return 124
+
+            return proc.returncode or 0
+        except asyncio.TimeoutError:
+            proc.kill()
+            return 124
+
     async def _exec_shell(self, params):
+        """Legacy non-streaming shell execution (kept for compatibility)."""
         cmd = params.get("command", "")
         if not cmd:
             return "", "no command specified", 1
@@ -341,6 +630,7 @@ class RemoteAgent:
             return "", "timeout", 124
 
     async def _exec_git(self, params):
+        """Legacy non-streaming git execution (kept for compatibility)."""
         args = []
         for key in ["subcommand", "args", "message", "branch", "remote", "path"]:
             if key in params:
@@ -361,6 +651,7 @@ class RemoteAgent:
             return "", "timeout", 124
 
     async def _exec_build(self, params, working_dir):
+        """Legacy non-streaming build execution (kept for compatibility)."""
         cmd = params.get("command", "go build ./...")
         print(f"[Agent] Build: {cmd} (dir={working_dir})")
         try:
@@ -371,6 +662,24 @@ class RemoteAgent:
                 cwd=working_dir or None,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+            return stdout.decode(errors="replace"), stderr.decode(errors="replace"), proc.returncode or 0
+        except asyncio.TimeoutError:
+            proc.kill()
+            return "", "timeout", 124
+
+    async def _exec_docker(self, params):
+        """Legacy non-streaming docker execution (kept for compatibility)."""
+        cmd = params.get("command", "")
+        if not cmd:
+            return "", "no docker command", 1
+        print(f"[Agent] Docker: {cmd}")
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f"docker {cmd}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
             return stdout.decode(errors="replace"), stderr.decode(errors="replace"), proc.returncode or 0
         except asyncio.TimeoutError:
             proc.kill()
@@ -398,23 +707,6 @@ class RemoteAgent:
             return "written", "", 0
         except Exception as e:
             return "", str(e), 1
-
-    async def _exec_docker(self, params):
-        cmd = params.get("command", "")
-        if not cmd:
-            return "", "no docker command", 1
-        print(f"[Agent] Docker: {cmd}")
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                f"docker {cmd}",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-            return stdout.decode(errors="replace"), stderr.decode(errors="replace"), proc.returncode or 0
-        except asyncio.TimeoutError:
-            proc.kill()
-            return "", "timeout", 124
 
     async def _heartbeat(self):
         while self.running:
